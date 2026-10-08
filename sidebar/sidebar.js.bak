@@ -1,0 +1,810 @@
+// ============================================================
+// AI Sidebar · 侧边栏页面逻辑(第六阶段)
+// ------------------------------------------------------------
+//   - 多会话管理(新建/切换/删除/持久化)
+//   - 聊天模式(普通聊天 / 当前网页 / 选中文字)上下文注入
+//   - BYOK AI 聊天(流式/停止/重新生成)(第五阶段,保留)
+//   - 网页读取(第三阶段,保留)
+//   - 选中文字(第四阶段,保留)
+// ============================================================
+
+"use strict";
+
+/* ------------------------------------------------------------------
+   消息类型
+   ------------------------------------------------------------------ */
+const MSG = {
+  CLOSE_SIDEBAR:    "ai-sidebar:close",
+  GET_PAGE_INFO:    "ai-sidebar:get-page-info",
+  GET_PAGE_TEXT:    "ai-sidebar:get-page-text",
+  GET_SELECTED_TEXT:  "ai-sidebar:get-selected-text",
+  SELECTION_CHANGED: "ai-sidebar:selection-changed",
+};
+
+/* ------------------------------------------------------------------
+   上下文限制
+   ------------------------------------------------------------------ */
+var MAX_SELECTION_CONTEXT   = 8000;
+
+/* ------------------------------------------------------------------
+   上下文配置 + Token 预估状态(第七阶段新增)
+   默认值先给字面量兜底,避免依赖脚本加载顺序;
+   init 与每次发送时由 loadContextSettings() 用存储值覆盖。
+   ------------------------------------------------------------------ */
+var contextConfig   = { pageMaxTokens: 4000, showTokenEstimate: true, showCostEstimate: true };
+var currentModelId  = "";
+var lastContextText = "";   // 最近一次构造上下文时实际使用的网页/选中文字正文
+
+/* ------------------------------------------------------------------
+   状态
+   ------------------------------------------------------------------ */
+var messages          = [];
+var activeSessionId   = null;
+var sessionName       = "";
+var chatMode          = "normal";
+var isGenerating      = false;
+var abortController   = null;
+var activeAiBubble    = null;
+var regenerateRow     = null;
+
+/* ------------------------------------------------------------------
+   DOM 引用
+   ------------------------------------------------------------------ */
+const chatList        = document.getElementById("chat-list");
+const chatForm        = document.getElementById("chat-form");
+const messageInput    = document.getElementById("message-input");
+const btnSend         = document.getElementById("btn-send");
+const btnStop         = document.getElementById("btn-stop");
+const btnSettings     = document.getElementById("btn-settings");
+
+const btnNewChat      = document.getElementById("btn-new-chat");
+const btnHistory      = document.getElementById("btn-history");
+const btnCurrentPage  = document.getElementById("btn-current-page");
+const btnFullText     = document.getElementById("btn-full-text");
+
+const estimateBar     = document.getElementById("estimate-bar");   // 第七阶段
+
+const sessionPanel    = document.getElementById("session-panel");
+const sessionListEl   = document.getElementById("session-list");
+const btnCloseHistory = document.getElementById("btn-close-history");
+
+const btnModeNormal    = document.getElementById("btn-mode-normal");
+const btnModePage      = document.getElementById("btn-mode-page");
+const btnModeSelection = document.getElementById("btn-mode-selection");
+const allModeBtns      = [btnModeNormal, btnModePage, btnModeSelection];
+
+const modelBar        = document.getElementById("model-bar");
+const providerDisplay = document.getElementById("provider-display");
+const modelDisplay    = document.getElementById("model-display");
+
+const selectionArea     = document.getElementById("selection-area");
+const selectionTextEl   = document.getElementById("selection-text");
+const selectionSourceEl = document.getElementById("selection-source");
+const btnCopySelection  = document.getElementById("btn-copy-selection");
+const btnClearSelection = document.getElementById("btn-clear-selection");
+const btnPutInput       = document.getElementById("btn-put-input");
+var currentSelection = "";
+
+/* ==================================================================
+   1. 初始化
+   ================================================================== */
+(async function init() {
+  loadConfigDisplay();
+  await loadContextSettings();
+  await restoreActiveSession();
+  refreshEstimate();
+
+  chatForm.addEventListener("submit", onSend);
+  btnStop.addEventListener("click", onStop);
+
+  messageInput.addEventListener("keydown", function (event) {
+    if (event.key === "Enter" && !event.shiftKey) {
+      event.preventDefault();
+      if (!isGenerating) chatForm.requestSubmit();
+    }
+  });
+
+  // 第七阶段:输入变化时刷新 Token 预估(防抖 300ms,失败不影响输入)
+  var estimateTimer = null;
+  messageInput.addEventListener("input", function () {
+    if (estimateTimer) clearTimeout(estimateTimer);
+    estimateTimer = setTimeout(function () { refreshEstimate(); }, 300);
+  });
+
+  btnNewChat.addEventListener("click", onNewChat);
+  btnHistory.addEventListener("click", onToggleHistory);
+  btnCloseHistory.addEventListener("click", function () {
+    sessionPanel.style.display = "none";
+  });
+
+  for (var i = 0; i < allModeBtns.length; i++) {
+    allModeBtns[i].addEventListener("click", function () {
+      setChatMode(this.getAttribute("data-mode"));
+    });
+  }
+
+  btnCurrentPage.addEventListener("click", onCurrentPage);
+  btnFullText.addEventListener("click", onFullPageText);
+
+  btnSettings.addEventListener("click", function () {
+    chrome.tabs.create({ url: chrome.runtime.getURL("settings/settings.html") });
+  });
+  modelBar.addEventListener("click", function () {
+    chrome.tabs.create({ url: chrome.runtime.getURL("settings/settings.html") });
+  });
+
+  btnCopySelection.addEventListener("click", function () {
+    if (!currentSelection) return;
+    navigator.clipboard.writeText(currentSelection).catch(function () {});
+  });
+  btnClearSelection.addEventListener("click", function () { hideSelection(); });
+  btnPutInput.addEventListener("click", function () {
+    if (currentSelection) { messageInput.value = currentSelection; messageInput.focus(); }
+  });
+
+  messageInput.focus();
+})();
+
+/* ==================================================================
+   2. Provider / Model 显示
+   ================================================================== */
+async function loadConfigDisplay() {
+  currentModelId = "";   // 第七阶段:先清空,仅在配置完整时由下方赋值(费用预估用)
+  try {
+    var config = await getApiConfig();
+    var apiKey = (config.keys && config.keys.length > 0) ? config.keys[0] : "";
+    if (apiKey && config.baseUrl && config.model) {
+      var preset = PROVIDER_PRESETS[config.provider];
+      var providerName = preset ? preset.name : "\u81ea\u5b9a\u4e49";  // 自定义
+      providerDisplay.textContent = config.configName || providerName;
+      modelDisplay.textContent    = config.modelName || config.model;
+      currentModelId              = config.model || "";   // 第七阶段:费用预估用
+    } else {
+      providerDisplay.textContent = "\u70b9\u51fb\u914d\u7f6e";  // 点击配置
+      modelDisplay.textContent    = "API";
+    }
+  } catch (e) {
+    // 第七阶段:配置读取失败同样不做费用预估
+    providerDisplay.textContent = "\u70b9\u51fb\u914d\u7f6e";  // 点击配置
+    modelDisplay.textContent    = "API";
+  }
+}
+
+/* ==================================================================
+   3. 会话管理(第六阶段)
+   ================================================================== */
+
+async function restoreActiveSession() {
+  try {
+    var sid = await getActiveSessionId();
+    var sessions = await loadSessions();
+    var found = null;
+    if (sid) {
+      for (var i = 0; i < sessions.length; i++) {
+        if (sessions[i].id === sid) { found = sessions[i]; break; }
+      }
+    }
+    if (found) {
+      activeSessionId = found.id;
+      sessionName     = found.name || "";
+      messages        = found.messages || [];
+      renderMessages();
+    } else {
+      var newSession = createSession();
+      activeSessionId = newSession.id;
+      sessionName     = "";
+      messages        = [];
+      await setActiveSessionId(activeSessionId);
+      await saveActiveSession([], "");
+    }
+  } catch (e) { /* silent */ }
+}
+
+function renderMessages() {
+  chatList.innerHTML = "";
+  if (messages.length === 0) {
+    var welcome = document.createElement("div");
+    welcome.className = "message system";
+    welcome.textContent = "\u6b22\u8fce\u4f7f\u7528 AI Sidebar \u00b7 \u8bf7\u5148\u901a\u8fc7\u300c\u8bbe\u7f6e\u300d\u914d\u7f6e API";  // 欢迎使用 AI Sidebar · 请先通过「设置」配置 API
+    chatList.appendChild(welcome);
+    return;
+  }
+  for (var i = 0; i < messages.length; i++) {
+    var msg = messages[i];
+    appendMessage(msg.role, msg.content);
+  }
+  if (messages[messages.length - 1].role === "assistant") {
+    addRegenerateRow();
+  }
+  scrollToBottom();
+}
+
+async function onNewChat() {
+  sessionPanel.style.display = "none";
+  var newSession = createSession();
+  activeSessionId = newSession.id;
+  sessionName     = "";
+  messages        = [];
+  await setActiveSessionId(activeSessionId);
+  await saveActiveSession([], "");
+  renderMessages();
+}
+
+async function onToggleHistory() {
+  if (sessionPanel.style.display === "none") {
+    var sessions = await loadSessions();
+    renderSessionList(sessions);
+    sessionPanel.style.display = "";
+  } else {
+    sessionPanel.style.display = "none";
+  }
+}
+
+function renderSessionList(sessions) {
+  sessionListEl.innerHTML = "";
+  if (sessions.length === 0) {
+    var empty = document.createElement("div");
+    empty.className = "session-item-empty";
+    empty.textContent = "\u6682\u65e0\u5386\u53f2\u4f1a\u8bdd";  // 暂无历史会话
+    sessionListEl.appendChild(empty);
+    return;
+  }
+  sessions.sort(function (a, b) { return b.updatedAt - a.updatedAt; });
+  for (var i = 0; i < sessions.length; i++) {
+    var s = sessions[i];
+    (function (session) {
+      var item = document.createElement("div");
+      item.className = "session-item";
+      if (session.id === activeSessionId) item.classList.add("active");
+
+      var nameSpan = document.createElement("span");
+      nameSpan.className = "session-item-name";
+      nameSpan.textContent = session.name || "\u65b0\u804a\u5929";  // 新聊天
+
+      var timeSpan = document.createElement("span");
+      timeSpan.className = "session-item-time";
+      timeSpan.textContent = relativeTime(session.updatedAt);
+
+      var delBtn = document.createElement("button");
+      delBtn.className = "session-item-del";
+      delBtn.textContent = "\u2715";  // ✕
+      delBtn.addEventListener("click", function (e) {
+        e.stopPropagation();
+        onDeleteSession(session.id);
+      });
+
+      item.appendChild(nameSpan);
+      item.appendChild(timeSpan);
+      item.appendChild(delBtn);
+      item.addEventListener("click", function () { onSwitchSession(session); });
+      sessionListEl.appendChild(item);
+    })(s);
+  }
+}
+
+async function onSwitchSession(session) {
+  sessionPanel.style.display = "none";
+  activeSessionId = session.id;
+  sessionName     = session.name || "";
+  messages        = session.messages || [];
+  await setActiveSessionId(activeSessionId);
+  renderMessages();
+}
+
+async function onDeleteSession(id) {
+  await deleteSession(id);
+  if (id === activeSessionId) {
+    var sessions = await loadSessions();
+    if (sessions.length > 0) {
+      await onSwitchSession(sessions[0]);
+    } else {
+      await onNewChat();
+    }
+  } else {
+    var sessions = await loadSessions();
+    renderSessionList(sessions);
+  }
+}
+
+function relativeTime(ts) {
+  var diff = Date.now() - ts;
+  if (diff < 60000) return "\u521a\u521a";  // 刚刚
+  if (diff < 3600000) return Math.floor(diff / 60000) + "\u5206\u949f\u524d";  // 分钟前
+  if (diff < 86400000) return Math.floor(diff / 3600000) + "\u5c0f\u65f6\u524d";  // 小时前
+  return Math.floor(diff / 86400000) + "\u5929\u524d";  // 天前
+}
+
+/* ==================================================================
+   4. 聊天模式(第六阶段)
+   ================================================================== */
+function setChatMode(mode) {
+  chatMode = mode;
+  lastContextText = "";   // 切换模式后旧上下文失效,预估先显示「发送时计算」
+  refreshEstimate();
+  for (var i = 0; i < allModeBtns.length; i++) {
+    if (allModeBtns[i].getAttribute("data-mode") === mode) {
+      allModeBtns[i].classList.add("active");
+    } else {
+      allModeBtns[i].classList.remove("active");
+    }
+  }
+}
+
+/* ==================================================================
+   5. 发送消息 —— 含上下文注入(第六阶段)
+   ================================================================== */
+function onSend(event) {
+  event.preventDefault();
+  if (isGenerating) return;
+  var text = messageInput.value.trim();
+  if (!text) return;
+  doSend(text);
+}
+
+async function doSend(text) {
+  // 第七阶段:每次发送前重新读取上下文配置(设置页改动无需重开侧边栏)
+  await loadContextSettings();
+
+  var config;
+  try { config = await getApiConfig(); } catch (e) { appendError("\u65e0\u6cd5\u8bfb\u53d6 API \u914d\u7f6e"); return; }  // 无法读取 API 配置
+  var apiKey = (config.keys && config.keys.length > 0) ? config.keys[0] : "";
+  if (!apiKey)  { appendError("\u8bf7\u5148\u914d\u7f6e API Key"); return; }  // 请先配置 API Key
+  if (!config.baseUrl) { appendError("\u8bf7\u5148\u914d\u7f6e API Base URL"); return; }
+  if (!config.model)   { appendError("\u8bf7\u5148\u914d\u7f6e\u6a21\u578b"); return; }  // 请先配置模型
+
+  var contextMessages = [];
+  if (chatMode === "page") {
+    var pageCtx = await fetchPageContext();
+    if (!pageCtx) return;
+    contextMessages.push({ role: "system", content: buildPageContextMessage(pageCtx) });
+  } else if (chatMode === "selection") {
+    if (!currentSelection) {
+      appendError("\u8bf7\u5148\u5728\u7f51\u9875\u4e2d\u9009\u4e2d\u6587\u5b57\uff0c\u518d\u4f7f\u7528\u6b64\u6a21\u5f0f");  // 请先在网页中选中文字，再使用此模式
+      return;
+    }
+    contextMessages.push({ role: "system", content: buildSelectionContextMessage() });
+  }
+
+  messages.push({ role: "user", content: text });
+  appendMessage("user", text);
+  messageInput.value = "";
+  messageInput.focus();
+
+  if (!sessionName && messages.length === 1) {
+    sessionName = text.slice(0, 30);
+  }
+
+  removeRegenerateRow();
+  activeAiBubble = createStreamingBubble();
+  var apiMessages = contextMessages.concat(messages);
+
+  // 第七阶段:发送前估算(此时上下文已构造完成,数字最接近真实请求)
+  refreshEstimate({ contextMessages: contextMessages, modelId: config.model });
+
+  startGenerating();
+  abortController = new AbortController();
+
+  try {
+    var fullText = await chatCompletionStream({
+      baseUrl:  config.baseUrl,
+      apiKey:   apiKey,
+      model:    config.model,
+      messages: apiMessages,
+      signal:   abortController.signal,
+      onToken:  function (_delta, currentFullText) {
+        if (activeAiBubble) { activeAiBubble.textContent = currentFullText; scrollToBottom(); }
+      },
+    });
+    messages.push({ role: "assistant", content: fullText });
+    addRegenerateRow();
+    await saveActiveSession(messages, sessionName);
+  } catch (err) {
+    handleStreamError(err);
+    await saveActiveSession(messages, sessionName);
+  } finally {
+    stopGenerating();
+    abortController = null;
+    refreshEstimate();   // 第七阶段:回复结束后刷新预估
+  }
+}
+
+/* ==================================================================
+   6. 停止生成
+   ================================================================== */
+function onStop() {
+  if (abortController) {
+    abortController.abort();
+    saveActiveSession(messages, sessionName).catch(function () {});
+  }
+}
+
+/* ==================================================================
+   7. 重新生成(含上下文重建)
+   ================================================================== */
+async function onRegenerate() {
+  if (isGenerating) return;
+
+  // 第七阶段:重新生成同样先刷新上下文配置
+  await loadContextSettings();
+  var lastUserIdx = -1;
+  for (var i = messages.length - 1; i >= 0; i--) {
+    if (messages[i].role === "user") { lastUserIdx = i; break; }
+  }
+  if (lastUserIdx < 0) return;
+  if (messages.length > lastUserIdx + 1 && messages[messages.length - 1].role === "assistant") {
+    messages.pop();
+  }
+  removeLastAiBubble();
+  removeRegenerateRow();
+
+  var config;
+  try { config = await getApiConfig(); } catch (e) { appendError("\u65e0\u6cd5\u8bfb\u53d6 API \u914d\u7f6e"); return; }
+  var apiKey = (config.keys && config.keys.length > 0) ? config.keys[0] : "";
+  if (!apiKey)  { appendError("\u8bf7\u5148\u914d\u7f6e API Key"); return; }
+  if (!config.baseUrl) { appendError("\u8bf7\u5148\u914d\u7f6e API Base URL"); return; }
+  if (!config.model)   { appendError("\u8bf7\u5148\u914d\u7f6e\u6a21\u578b"); return; }
+
+  var contextMessages = [];
+  if (chatMode === "page") {
+    var pageCtx = await fetchPageContext();
+    if (!pageCtx) return;
+    contextMessages.push({ role: "system", content: buildPageContextMessage(pageCtx) });
+  } else if (chatMode === "selection") {
+    if (!currentSelection) { appendError("\u8bf7\u5148\u5728\u7f51\u9875\u4e2d\u9009\u4e2d\u6587\u5b57"); return; }
+    contextMessages.push({ role: "system", content: buildSelectionContextMessage() });
+  }
+
+  activeAiBubble = createStreamingBubble();
+
+  var apiMessages = contextMessages.concat(messages);
+
+  // 第七阶段:发送前估算
+  refreshEstimate({ contextMessages: contextMessages, modelId: config.model });
+
+  startGenerating();
+  abortController = new AbortController();
+
+  try {
+    var fullText = await chatCompletionStream({
+      baseUrl:  config.baseUrl,
+      apiKey:   apiKey,
+      model:    config.model,
+      messages: apiMessages,
+      signal:   abortController.signal,
+      onToken:  function (_delta, currentFullText) {
+        if (activeAiBubble) { activeAiBubble.textContent = currentFullText; scrollToBottom(); }
+      },
+    });
+    messages.push({ role: "assistant", content: fullText });
+    addRegenerateRow();
+    await saveActiveSession(messages, sessionName);
+  } catch (err) {
+    handleStreamError(err);
+    await saveActiveSession(messages, sessionName);
+  } finally {
+    stopGenerating();
+    abortController = null;
+    refreshEstimate();   // 第七阶段:回复结束后刷新预估
+  }
+}
+
+/* ==================================================================
+   8. 网页上下文获取与构建(第六阶段)
+   ================================================================== */
+
+async function fetchPageContext() {
+  try {
+    var response = await chrome.runtime.sendMessage({ type: MSG.GET_PAGE_TEXT });
+    if (response && response.ok) return response;
+    appendError("\u65e0\u6cd5\u8bfb\u53d6\u5f53\u524d\u7f51\u9875\u5185\u5bb9\uff0c\u8bf7\u5237\u65b0\u9875\u9762\u540e\u91cd\u8bd5");  // 无法读取当前网页内容，请刷新页面后重试
+    return null;
+  } catch (e) {
+    appendError("\u8bfb\u53d6\u7f51\u9875\u5931\u8d25: " + String(e));  // 读取网页失败:
+    return null;
+  }
+}
+
+function buildPageContextMessage(pageInfo) {
+  var text = pageInfo.text || "";
+  var totalLen = text.length;
+  if (text.length > MAX_PAGE_CONTEXT_CHARS) {
+    text = text.slice(0, MAX_PAGE_CONTEXT_CHARS);
+  }
+  var truncNote = totalLen > MAX_PAGE_CONTEXT_CHARS
+    ? "\n\n[\u7f51\u9875\u5185\u5bb9\u8fc7\u957f\uff0c\u5df2\u622a\u65ad\u3002\u539f\u6587\u5171 " + totalLen + " \u5b57\u7b26\uff0c\u4ec5\u53d1\u9001\u524d " + MAX_PAGE_CONTEXT_CHARS + " \u5b57\u7b26]"  // 网页内容过长，已截断。原文共 X 字符，仅发送前 X 字符
+    : "";
+  return "\u4f60\u6b63\u5728\u5e2e\u52a9\u7528\u6237\u7406\u89e3\u5f53\u524d\u7f51\u9875\u3002\u4ee5\u4e0b\u662f\u7f51\u9875\u4fe1\u606f:\n\n" +  // 你正在帮助用户理解当前网页。以下是网页信息:
+    "\u7f51\u9875\u6807\u9898: " + (pageInfo.title || "\u672a\u77e5") + "\n" +  // 网页标题: 未知
+    "\u7f51\u9875\u5730\u5740: " + (pageInfo.url || "\u672a\u77e5") + "\n\n" +   // 网页地址: 未知
+    "\u7f51\u9875\u6b63\u6587:\n" + text + truncNote;  // 网页正文:
+}
+
+function buildSelectionContextMessage() {
+  var text = currentSelection;
+  if (text.length > MAX_SELECTION_CONTEXT) {
+    text = text.slice(0, MAX_SELECTION_CONTEXT);
+  }
+  lastContextText = text;   // 第七阶段:供 Token 预估使用
+  var title = "";
+  try {
+    var selTitle = selectionSourceEl.textContent || "";
+    if (selTitle) title = "\n\u7f51\u9875\u6807\u9898: " + selTitle;  // 网页标题:
+  } catch (e) {}
+  return "\u7528\u6237\u5728\u7f51\u9875\u4e2d\u9009\u4e2d\u4e86\u4e00\u6bb5\u6587\u5b57\uff0c\u8bf7\u6839\u636e\u8fd9\u6bb5\u6587\u5b57\u56de\u7b54\u95ee\u9898\u3002" +  // 用户在网页中选中了一段文字，请根据这段文字回答问题。
+    title + "\n\n\u9009\u4e2d\u6587\u5b57:\n" + text;  // 选中文字:
+}
+
+/* ==================================================================
+   8b. 上下文控制与 Token 预估(第七阶段 · 新增)
+   ----------------------------------------------------------------
+   只负责读取配置与渲染预估栏:
+     - 不改消息结构、不改三端通信方式、不写入会话数据
+     - 任何异常都只让预估栏隐藏,绝不影响发送流程
+   ================================================================== */
+
+/** 读取上下文配置(失败时保留默认值,不抛出) */
+async function loadContextSettings() {
+  try {
+    contextConfig = await getContextConfig();
+  } catch (e) {
+    // 静默降级:沿用默认配置
+  }
+}
+
+/** 当前模式下用于估算的上下文正文 */
+function currentContextText() {
+  if (chatMode === "selection") return currentSelection || "";
+  if (chatMode === "page")      return lastContextText || "";
+  return "";
+}
+
+/**
+ * 刷新预估栏
+ * @param {{contextMessages?: Array, modelId?: string}} opts
+ *        发送前传入本次真正使用的上下文消息,可得到最接近真实请求的数字
+ */
+function refreshEstimate(opts) {
+  if (!estimateBar) return;   // 兜底:节点缺失时直接跳过
+  try {
+    if (!contextConfig.showTokenEstimate) { estimateBar.style.display = "none"; return; }
+
+    opts = opts || {};
+    var contextMessages = opts.contextMessages || [];
+    var modelId         = opts.modelId || currentModelId;
+
+    // 输入框草稿会随本次请求一起发出,计入「历史消息」
+    var estMessages = messages.slice();
+    if (!isGenerating) {
+      var draft = messageInput.value.trim();
+      if (draft) estMessages.push({ role: "user", content: draft });
+    }
+
+    var breakdown = buildEstimateBreakdown({
+      pageText:        currentContextText(),
+      pagePending:     chatMode === "page" && !lastContextText,
+      contextMessages: contextMessages,
+      historyMessages: estMessages,
+    });
+
+    var costInfo = contextConfig.showCostEstimate
+      ? estimateCost(breakdown.totalTokens, modelId)
+      : null;
+
+    renderEstimate(breakdown, costInfo, contextConfig.showCostEstimate);
+  } catch (e) {
+    estimateBar.style.display = "none";   // 估算失败静默降级,不影响聊天
+  }
+}
+
+/** 渲染预估栏 */
+function renderEstimate(breakdown, costInfo, showCost) {
+  var report = buildEstimateReport(breakdown, chatMode === "selection");
+
+  estimateBar.innerHTML = "";
+
+  var title = document.createElement("div");
+  title.className   = "estimate-title";
+  title.textContent = report.title;
+  estimateBar.appendChild(title);
+
+  for (var i = 0; i < report.rows.length; i++) {
+    estimateBar.appendChild(makeEstimateRow(report.rows[i].label, report.rows[i].value, ""));
+  }
+  estimateBar.appendChild(makeEstimateRow(report.total.label, report.total.value, "estimate-line-total"));
+
+  if (showCost) {
+    var cost = document.createElement("div");
+    cost.className   = "estimate-cost";
+    cost.textContent = formatCostLine(costInfo);
+    estimateBar.appendChild(cost);
+  }
+
+  var warning = buildContextWarning(breakdown.totalTokens);
+  if (warning) {
+    var warn = document.createElement("div");
+    warn.className   = "estimate-warn";
+    warn.textContent = warning;
+    estimateBar.appendChild(warn);
+  }
+
+  estimateBar.style.display = "";
+}
+
+/** 预估栏的一行:左标签 + 右数值 */
+function makeEstimateRow(label, value, extraClass) {
+  var row = document.createElement("div");
+  row.className = "estimate-line" + (extraClass ? " " + extraClass : "");
+
+  var labelEl = document.createElement("span");
+  labelEl.textContent = label;
+
+  var valueEl = document.createElement("span");
+  valueEl.textContent = value;
+
+  row.appendChild(labelEl);
+  row.appendChild(valueEl);
+  return row;
+}
+
+/* ==================================================================
+   9. 流式聊天辅助函数(第五阶段,保留)
+   ================================================================== */
+function createStreamingBubble() {
+  var div = document.createElement("div");
+  div.className = "message bot"; div.textContent = "";
+  chatList.appendChild(div); scrollToBottom(); return div;
+}
+
+function addRegenerateRow() {
+  removeRegenerateRow();
+  var row = document.createElement("div"); row.className = "regenerate-row";
+  var btn = document.createElement("button"); btn.className = "btn-msg-action";
+  btn.textContent = "\u91cd\u65b0\u751f\u6210";  // 重新生成
+  btn.addEventListener("click", onRegenerate);
+  row.appendChild(btn); chatList.appendChild(row); scrollToBottom();
+  regenerateRow = row;
+}
+
+function removeRegenerateRow() {
+  if (regenerateRow && regenerateRow.parentNode) regenerateRow.remove();
+  regenerateRow = null;
+}
+
+function removeLastAiBubble() {
+  var bubbles = chatList.querySelectorAll(".message.bot");
+  if (bubbles.length > 0) bubbles[bubbles.length - 1].remove();
+}
+
+function startGenerating() {
+  isGenerating = true;
+  btnSend.style.display = "none"; btnStop.style.display = "";
+  messageInput.disabled = true;
+  messageInput.placeholder = "AI \u6b63\u5728\u751f\u6210\u4e2d\u2026";  // AI 正在生成中…
+}
+
+function stopGenerating() {
+  isGenerating = false;
+  btnStop.style.display = "none"; btnSend.style.display = "";
+  messageInput.disabled = false;
+  messageInput.placeholder = "\u8f93\u5165\u6d88\u606f,Enter \u53d1\u9001,Shift+Enter \u6362\u884c";  // 输入消息,Enter 发送,Shift+Enter 换行
+  messageInput.focus();
+}
+
+function handleStreamError(err) {
+  if (err && err.name === "AbortError") {
+    if (activeAiBubble && activeAiBubble.textContent) {
+      messages.push({ role: "assistant", content: activeAiBubble.textContent });
+    } else if (activeAiBubble) { activeAiBubble.remove(); }
+    return;
+  }
+  var errorMsg;
+  if (err && err.isApiError) errorMsg = "\u274c " + err.message;  // ❌
+  else if (err && typeof err.message === "string" && err.message.indexOf("Failed to fetch") !== -1)
+    errorMsg = "\u274c \u65e0\u6cd5\u8fde\u63a5 API\uff0c\u8bf7\u68c0\u67e5\u7f51\u7edc\u6216 Base URL";  // ❌ 无法连接 API，请检查网络或 Base URL
+  else errorMsg = "\u274c \u8bf7\u6c42\u5931\u8d25: " + (err ? (err.message || String(err)) : "\u672a\u77e5\u9519\u8bef");  // ❌ 请求失败: 未知错误
+  if (activeAiBubble) {
+    activeAiBubble.textContent = errorMsg;
+    activeAiBubble.classList.add("error");
+  }
+}
+
+function appendError(text) {
+  var item = document.createElement("div");
+  item.className = "message system error"; item.textContent = text;
+  chatList.appendChild(item); chatList.scrollTop = chatList.scrollHeight;
+}
+
+function scrollToBottom() { chatList.scrollTop = chatList.scrollHeight; }
+
+/* ==================================================================
+   10. "当前网页" —— 网页详细数据(第三阶段,保留不变)
+   ================================================================== */
+async function onCurrentPage() {
+  try {
+    const response = await chrome.runtime.sendMessage({ type: MSG.GET_PAGE_INFO });
+    if (response && response.ok) {
+      const lines = [
+        "\ud83d\udcc4 \u5f53\u524d\u7f51\u9875\u4fe1\u606f", "",  // 📄 当前网页信息
+        "\u6807\u9898: "  + (response.title       || "(\u65e0)"),  // 标题:  (无)
+        "URL: "   + (response.url         || "(\u65e0)"),
+        "\u6587\u672c\u957f\u5ea6: " + (response.textLength  || 0) + " \u5b57\u7b26",  // 文本长度:  字符
+        "\u94fe\u63a5: "  + (response.linkCount   || 0) + " \u4e2a",  // 链接:  个
+        "\u56fe\u7247: "  + (response.imageCount  || 0) + " \u4e2a",  // 图片:  个
+        "\u89c6\u9891: "  + (response.videoCount  || 0) + " \u4e2a",  // 视频:  个
+        "\u97f3\u9891: "  + (response.audioCount  || 0) + " \u4e2a",  // 音频:  个
+      ];
+      if (response.selectedText) lines.push("", "--- \u5f53\u524d\u9009\u4e2d\u6587\u5b57 ---", response.selectedText);  // 当前选中文字
+      if (response.textPreview)  lines.push("", "--- \u6b63\u6587\u9884\u89c8(\u524d 500 \u5b57\u7b26) ---", response.textPreview);  // 正文预览(前 500 字符)
+      appendMessage("system", lines.join("\n"));
+    } else {
+      const error = (response && response.error) || "\u672a\u77e5\u9519\u8bef";  // 未知错误
+      appendMessage("system", "\u65e0\u6cd5\u83b7\u53d6\u7f51\u9875\u4fe1\u606f:\n" + error);  // 无法获取网页信息:
+    }
+  } catch (error) { appendMessage("system", "\u8bfb\u53d6\u7f51\u9875\u4fe1\u606f\u5931\u8d25: " + String(error)); }  // 读取网页信息失败:
+}
+
+/* ==================================================================
+   11. "读取完整网页" —— 获取全部文本(第三阶段,保留不变)
+   ================================================================== */
+async function onFullPageText() {
+  try {
+    const response = await chrome.runtime.sendMessage({ type: MSG.GET_PAGE_TEXT });
+    if (response && response.ok) {
+      const truncNote = response.truncated
+        ? "\n(\u5168\u6587\u8fc7\u957f,\u5df2\u622a\u65ad\u81f3 " + response.text.length + " \u5b57\u7b26,\u5efa\u8bae\u5728\u5b8c\u6574\u7f51\u9875\u4e0a\u67e5\u770b)"  // 全文过长,已截断至 X 字符,建议在完整网页上查看
+        : "";
+      const lines = [
+        "\ud83d\udcc4 \u7f51\u9875\u5b8c\u6574\u6587\u672c", "",  // 📄 网页完整文本
+        "\u6807\u9898: " + (response.title || "(\u65e0)"),
+        "URL: "  + (response.url   || "(\u65e0)"),
+        "\u5168\u6587\u5171 " + (response.length || 0) + " \u5b57\u7b26" + truncNote,  // 全文共 X 字符
+        "", response.text || "(\u65e0\u6587\u672c\u5185\u5bb9)",  // 无文本内容
+      ];
+      appendMessage("system", lines.join("\n"));
+    } else {
+      const error = (response && response.error) || "\u672a\u77e5\u9519\u8bef";
+      appendMessage("system", "\u65e0\u6cd5\u8bfb\u53d6\u5b8c\u6574\u7f51\u9875\u6587\u672c:\n" + error);  // 无法读取完整网页文本:
+    }
+  } catch (error) { appendMessage("system", "\u8bfb\u53d6\u5b8c\u6574\u7f51\u9875\u6587\u672c\u5931\u8d25: " + String(error)); }  // 读取完整网页文本失败:
+}
+
+/* ==================================================================
+   12. 追加消息(通用)
+   ================================================================== */
+function appendMessage(role, text) {
+  var item = document.createElement("div");
+  item.className = "message " + role;
+  item.textContent = text;
+  chatList.appendChild(item);
+  chatList.scrollTop = chatList.scrollHeight;
+}
+
+/* ==================================================================
+   13. 选中文字显示 / 隐藏(第四阶段,保留不变)
+   ================================================================== */
+function showSelection(message) {
+  var text = message.selectedText || "";
+  if (!text) return;
+  currentSelection = text;
+  selectionTextEl.textContent = text;
+  selectionSourceEl.textContent =
+    "\u7f51\u9875\u6807\u9898: " + (message.pageTitle || "(\u65e0)") +  // 网页标题:  (无)
+    "  |  " + (message.pageUrl || "");
+  selectionArea.style.display = "block";
+}
+
+function hideSelection() {
+  selectionArea.style.display = "none";
+  selectionTextEl.textContent = "";
+  selectionSourceEl.textContent = "";
+  currentSelection = "";
+}
+
+/* ==================================================================
+   14. 接收来自后台的消息(第四阶段,保留)
+   ================================================================== */
+chrome.runtime.onMessage.addListener(function (message) {
+  if (message && message.type === MSG.CLOSE_SIDEBAR) { window.close(); return false; }
+  if (message && message.type === MSG.SELECTION_CHANGED) { showSelection(message); return false; }
+  return false;
+});

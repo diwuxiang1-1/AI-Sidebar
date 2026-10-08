@@ -1,0 +1,242 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>AI Sidebar</title>
+  <link rel="stylesheet" href="sidebar.css" />
+</head>
+<body>
+
+  <!-- ========== 顶部标题栏 ========== -->
+  <header class="sidebar-header">
+    <h1 class="app-title">AI Sidebar</h1>
+    <!-- ❤️ 支持项目:点开只是一个弹窗,不发任何请求、不改任何设置 -->
+    <button id="btn-support" class="btn btn-small btn-support" type="button" data-i18n="app.support">❤️ 支持项目</button>
+    <button id="btn-settings" class="btn" type="button" data-i18n="app.settings">设置</button>
+  </header>
+
+  <!-- ========== 页面切换(第八轮) ========== -->
+  <div id="page-bar" class="page-bar">
+    <button id="btn-page-chat" class="page-btn active" data-page="chat" type="button" data-i18n="page.chat">聊天</button>
+    <button id="btn-page-resources" class="page-btn" data-page="resources" type="button" data-i18n="page.resources">网页资源</button>
+  </div>
+
+  <!-- ========== AI 操作目标栏(第四阶段) ==========
+       始终显示 AI 正在操作哪个网页 ——「浏览器现在看哪个」与「AI 操作哪个」是两件事 -->
+  <div id="target-bar" class="target-bar">
+    <div class="target-current">
+      <span class="target-label" data-i18n="target.label">AI 当前操作目标</span>
+      <span id="target-current-name" class="target-name">当前活动网页</span>
+    </div>
+    <div class="target-actions">
+      <button id="btn-target-lock" class="btn btn-small btn-primary" type="button" data-i18n="target.lock">锁定此网页</button>
+      <button id="btn-target-panel" class="btn btn-small" type="button">已锁定 <span id="target-count">0</span></button>
+    </div>
+  </div>
+
+  <!-- ========== 锁定目标面板(第四阶段,默认隐藏) ========== -->
+  <div id="target-panel" class="target-panel" style="display:none;">
+    <div class="target-panel-header">
+      <span>已锁定的网页</span>
+      <button id="btn-close-target" class="btn-close-panel" type="button">✕</button>
+    </div>
+    <div id="target-status" class="target-status"></div>
+    <div id="target-list" class="target-list"></div>
+    <!-- 刷新后的修改恢复状态(第四阶段) -->
+    <div id="target-recover" class="target-recover" style="display:none;">
+      <div id="target-recover-text" class="target-card-meta"></div>
+      <div class="target-card-actions">
+        <button id="btn-target-reanalyze" class="btn btn-small" type="button" data-i18n="target.reanalyze">重新分析网页</button>
+        <button id="btn-target-clear-plan" class="btn btn-small" type="button" data-i18n="target.clearPlan">清除该网页修改</button>
+      </div>
+    </div>
+    <div class="target-panel-foot">
+      <button id="btn-target-refresh" class="btn btn-small" type="button" data-i18n="target.refresh">刷新状态</button>
+      <button id="btn-target-lock-panel" class="btn btn-small btn-primary" type="button" data-i18n="target.lock">锁定当前网页</button>
+    </div>
+  </div>
+
+  <!-- ========== 页面 1:聊天(以下内容原样搬入容器,未改动结构) ========== -->
+  <div id="page-chat" class="page">
+
+  <!-- ========== Provider / Model 显示栏(点击进入设置) ========== -->
+  <div id="model-bar" class="model-bar model-bar-clickable" title="点击配置 API">
+    <span class="model-label">配置</span>
+    <span id="provider-display" class="model-display">点击配置</span>
+    <span class="model-label">模型</span>
+    <span id="model-display" class="model-display">API</span>
+  </div>
+
+  <!-- ========== 聊天模式选择栏(第六阶段) ========== -->
+  <div id="mode-bar" class="mode-bar">
+    <button id="btn-mode-normal" class="mode-btn active" data-mode="normal" type="button" data-i18n="mode.normal">普通聊天</button>
+    <button id="btn-mode-page" class="mode-btn" data-mode="page" type="button" data-i18n="mode.page">当前网页</button>
+  </div>
+
+  <!-- ========== 网页翻译面板(第七轮,默认隐藏) ========== -->
+  <div id="translate-panel" class="translate-panel" style="display:none;">
+    <div class="translate-header">
+      <span class="translate-title">网页翻译</span>
+      <button id="btn-close-translate" class="btn-close-panel" type="button">✕</button>
+    </div>
+
+    <div class="translate-row">
+      <label for="translate-lang">目标语言</label>
+      <select id="translate-lang" class="translate-select"></select>
+    </div>
+
+    <div class="translate-row">
+      <label for="translate-mode">翻译方式</label>
+      <select id="translate-mode" class="translate-select"></select>
+    </div>
+
+    <div class="translate-actions">
+      <button id="btn-translate-start" class="btn btn-primary" type="button">翻译网页</button>
+      <button id="btn-translate-stop" class="btn btn-stop" type="button" style="display:none;">停止</button>
+      <button id="btn-translate-restore" class="btn" type="button" style="display:none;">恢复原文</button>
+    </div>
+
+    <div id="translate-status" class="translate-status"></div>
+  </div>
+
+  <!-- ========== AI 修改网页面板(第九轮,默认隐藏) ========== -->
+  <div id="patch-panel" class="patch-panel" style="display:none;">
+    <div class="patch-header">
+      <span class="patch-title">AI 修改网页</span>
+      <button id="btn-close-patch" class="btn-close-panel" type="button">✕</button>
+    </div>
+
+    <div id="patch-perm" class="patch-perm"></div>
+
+    <div class="patch-hint">在下方输入框写要求,例如「背景改深色,正文放大,隐藏右侧栏」,再点「执行网页修改」。<br />开着「当前网页」时,直接在聊天框说「把背景改成深色」也会执行修改,结果和「撤销」按钮都出现在聊天里。</div>
+
+    <div class="patch-actions">
+      <button id="btn-patch-apply" class="btn btn-primary" type="button" data-i18n="patch.apply">执行网页修改</button>
+      <button id="btn-patch-deep" class="btn" type="button" data-i18n="patch.deep">深度分析网页</button>
+      <button id="btn-patch-undo" class="btn" type="button" style="display:none;" data-i18n="patch.undo">撤销</button>
+      <button id="btn-patch-restore" class="btn" type="button" style="display:none;" data-i18n="patch.restorePage">恢复网页</button>
+    </div>
+
+    <div id="patch-deep" class="patch-deep"></div>
+    <div id="patch-status" class="patch-status"></div>
+
+    <details id="audit-box" class="audit-box">
+      <summary>操作记录</summary>
+      <div id="audit-list" class="audit-list"></div>
+    </details>
+  </div>
+
+  <!-- ========== 会话历史面板(默认隐藏) ========== -->
+  <div id="session-panel" class="session-panel" style="display:none;">
+    <div class="session-panel-header">
+      <span>聊天历史</span>
+      <button id="btn-close-history" class="btn-close-panel" type="button">✕</button>
+    </div>
+    <div id="session-list" class="session-list"></div>
+  </div>
+
+  <!-- ========== 聊天区域(可滚动) ========== -->
+  <main id="chat-list" class="chat-list">
+    <div class="message system">欢迎使用 AI Sidebar · 请先通过「设置」配置 API</div>
+  </main>
+
+  <!-- ========== 工具栏 ========== -->
+  <div class="toolbar">
+    <button id="btn-new-chat" class="btn" type="button" data-i18n="tool.newChat">新聊天</button>
+    <button id="btn-history" class="btn" type="button" data-i18n="tool.history">历史</button>
+    <button id="btn-current-page" class="btn" type="button" data-i18n="tool.currentPage">当前网页</button>
+    <button id="btn-full-text" class="btn" type="button" data-i18n="tool.fullText">读取完整网页</button>
+    <button id="btn-translate" class="btn" type="button" data-i18n="tool.translate">网页翻译</button>
+    <button id="btn-patch" class="btn" type="button" data-i18n="tool.patch">修改网页</button>
+  </div>
+
+  <!-- ========== 实际用量栏(默认隐藏,回复结束后由 API 返回的 usage 填充) ==========
+       只显示服务商真实返回的数字;没有返回就写「未提供实际用量」,不做本地估算 -->
+  <div id="usage-bar" class="usage-bar" style="display:none;"></div>
+
+  <!-- ========== 固定在底部的输入区域 ========== -->
+  <form id="chat-form" class="chat-form">
+    <!-- 选中文字:自动上下文,不再是独立模式(第十四轮) -->
+    <!-- 已添加的文件(完整版) -->
+    <div id="file-chip" class="file-chip" style="display:none;">
+      <span id="file-chip-text" class="file-chip-text"></span>
+      <button id="file-chip-clear" class="chip-close" type="button" title="移除文件">×</button>
+    </div>
+    <!-- 选中文字(收尾轮):显示实际内容,纯本地渲染,不调用 AI -->
+    <div id="selection-panel" class="selection-panel" style="display:none;">
+      <div class="selection-head">
+        <span class="selection-title">已选中文字</span>
+        <span id="selection-count" class="selection-count"></span>
+        <button id="btn-selection-toggle" class="btn btn-small" type="button">展开</button>
+        <button id="selection-chip-clear" class="chip-close" type="button" title="清除选中文字">×</button>
+      </div>
+      <div id="selection-preview" class="selection-preview"></div>
+      <div class="selection-actions">
+        <button id="btn-selection-copy" class="btn btn-small" type="button">复制</button>
+        <button id="btn-selection-toinput" class="btn btn-small btn-primary" type="button">加入输入框</button>
+      </div>
+    </div>
+    <textarea
+      id="message-input"
+      class="chat-input"
+      rows="2"
+      placeholder="输入消息,Enter 发送,Shift+Enter 换行"
+    ></textarea>
+    <!-- 文件输入(完整版):本地读取,不上传 -->
+    <button id="btn-add-file" class="btn btn-file" type="button" data-i18n-title="input.addFile" title="添加文件">📎</button>
+    <input id="file-input" class="file-input-hidden" type="file" multiple
+           accept=".txt,.md,.json,.csv,.log,.xml,.html,.css,.js,.ts,.yaml,.yml,.py,.sql,image/*" />
+    <button id="btn-stop" class="btn btn-stop" type="button" style="display:none;" data-i18n="input.stop">停止</button>
+    <button id="btn-send" class="btn btn-primary" type="submit" data-i18n="input.send">发送</button>
+  </form>
+
+  </div><!-- /页面 1:聊天 -->
+
+  <!-- ========== 页面 2:网页资源(第八轮) ========== -->
+  <div id="page-resources" class="page" style="display:none;">
+    <div class="res-toolbar">
+      <span class="res-page-title" data-i18n="res.title">网页资源</span>
+      <button id="btn-res-refresh" class="btn btn-small" type="button" data-i18n="res.refresh">刷新</button>
+    </div>
+    <div id="res-status" class="res-status"></div>
+    <div id="res-list" class="res-list"></div>
+  </div>
+
+  <!-- ========== ❤️ 支持项目(捐赠弹窗,默认隐藏) ==========
+       纯本地弹窗:两个按钮分别在新标签页打开 Ko-fi / 爱发电,扩展不做任何支付处理 -->
+  <div id="support-modal" class="support-modal" style="display:none;">
+    <div class="support-box">
+      <div class="support-head">
+        <span class="support-title" data-i18n="support.title">❤️ 支持项目</span>
+        <button id="btn-close-support" class="btn-close-panel" type="button">✕</button>
+      </div>
+      <div class="support-body">
+        <div class="support-text" data-i18n="support.text">这个扩展完全免费,也没有任何后端。如果它帮到了你,可以请作者喝杯咖啡 —— 完全自愿,不影响任何功能。</div>
+        <div class="support-row">
+          <button id="btn-donate-kofi" class="btn support-link" type="button">Ko-fi</button>
+          <span class="support-url">ko-fi.com/wuxiangdi/tip</span>
+        </div>
+        <div class="support-row">
+          <button id="btn-donate-afdian" class="btn support-link" type="button">爱发电</button>
+          <span class="support-url">afdian.com/a/Sidebar</span>
+        </div>
+        <div class="support-note" data-i18n="support.note">捐赠页面会在新标签页打开,扩展不经手任何支付信息。</div>
+      </div>
+    </div>
+  </div>
+
+  <!-- 加载顺序:storage → provider → context → translate → sidebar(后者依赖前者,顺序不可调整) -->
+  <script src="../utils/storage.js"></script>
+  <script src="../providers/openai-compatible.js"></script>
+  <script src="../utils/context.js"></script>
+  <script src="../utils/translate.js"></script>
+  <script src="../utils/webpatch.js"></script>
+  <script src="../utils/permissions.js"></script>
+  <script src="../utils/browser-tools.js"></script>
+  <script src="../utils/targets.js"></script>
+  <script src="../utils/i18n.js"></script>
+  <script src="../utils/files.js"></script>
+  <script src="sidebar.js"></script>
+</body>
+</html>

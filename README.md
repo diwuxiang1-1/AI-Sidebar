@@ -143,6 +143,7 @@ OpenAI
 DeepSeek
 Claude
 SiliconFlow
+Demon Route（开源权重模型网关，含无审查微调模型）
 其他兼容 OpenAI API 格式的服务
 
 支持：

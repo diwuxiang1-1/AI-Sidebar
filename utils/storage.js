@@ -17,6 +17,7 @@ var PROVIDER_PRESETS = {
   siliconflow: { name: "SiliconFlow", baseUrl: "https://api.siliconflow.cn/v1" },
   claude:      { name: "Claude",      baseUrl: "https://api.anthropic.com/v1" },
   google:      { name: "Google",      baseUrl: "https://generativelanguage.googleapis.com/v1beta/openai" },
+  demonroute:  { name: "Demon Route", baseUrl: "https://api.demonroute.com/v1" },
   custom:      { name: "自定义",      baseUrl: "" },
 };
 
